@@ -39,41 +39,43 @@ def compute_mfi(df, period=MFI_PERIOD):
 
 
 def compute_supertrend(df, period=ST_PERIOD, mult=ST_MULT):
-    hl2 = (df["high"] + df["low"]) / 2
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs(),
-    ], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean()
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    close = df["close"].to_numpy()
+    n = len(df)
+
+    hl2 = (high + low) / 2
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+    atr = pd.Series(tr).rolling(period).mean().to_numpy()
 
     upper = hl2 + mult * atr
     lower = hl2 - mult * atr
 
-    trend = pd.Series(index=df.index, dtype="int64")
+    trend = np.ones(n, dtype=np.int64)
     final_upper = upper.copy()
     final_lower = lower.copy()
-    trend.iloc[0] = 1
 
-    for i in range(1, len(df)):
-        if df["close"].iloc[i - 1] > final_upper.iloc[i - 1]:
-            final_upper.iloc[i] = min(upper.iloc[i], final_upper.iloc[i - 1]) if trend.iloc[i - 1] == -1 else upper.iloc[i]
+    for i in range(1, n):
+        if close[i - 1] > final_upper[i - 1]:
+            final_upper[i] = min(upper[i], final_upper[i - 1]) if trend[i - 1] == -1 else upper[i]
         else:
-            final_upper.iloc[i] = upper.iloc[i]
+            final_upper[i] = upper[i]
 
-        if df["close"].iloc[i] > final_upper.iloc[i]:
-            trend.iloc[i] = 1
-        elif df["close"].iloc[i] < final_lower.iloc[i]:
-            trend.iloc[i] = -1
+        if close[i] > final_upper[i]:
+            trend[i] = 1
+        elif close[i] < final_lower[i]:
+            trend[i] = -1
         else:
-            trend.iloc[i] = trend.iloc[i - 1]
+            trend[i] = trend[i - 1]
 
-        if trend.iloc[i] == 1:
-            final_lower.iloc[i] = max(lower.iloc[i], final_lower.iloc[i - 1]) if trend.iloc[i - 1] == 1 else lower.iloc[i]
+        if trend[i] == 1:
+            final_lower[i] = max(lower[i], final_lower[i - 1]) if trend[i - 1] == 1 else lower[i]
         else:
-            final_lower.iloc[i] = lower.iloc[i]
+            final_lower[i] = lower[i]
 
-    return trend
+    return pd.Series(trend, index=df.index)
 
 
 def build_indicators(df):
@@ -353,11 +355,20 @@ def get_us_ohlcv(ticker, years=2):
 
 # ---------- 실행 ----------
 
-def scan_market(market, top_n, strategy_keys=None):
+def _process_one(ticker, name, fetch, strategy_keys, currency):
+    df = fetch(ticker)
+    if len(df) < max(MA_LONG, 80):
+        return []
+    df = build_indicators(df)
+    return [summarize_strategy(name, ticker, df, sk, currency) for sk in strategy_keys]
+
+
+def scan_market(market, top_n, strategy_keys=None, progress_callback=None, max_workers=8):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     if strategy_keys is None:
         strategy_keys = list(STRATEGIES.keys())
 
-    results = []
     if market == "kr":
         tickers, names = get_kr_universe(top_n)
         fetch = get_kr_ohlcv
@@ -368,22 +379,26 @@ def scan_market(market, top_n, strategy_keys=None):
         fetch = get_us_ohlcv
         currency = "$"
 
+    results = []
     fetch_fail = 0
-    for i, t in enumerate(tickers):
-        try:
-            df = fetch(t)
-            if len(df) < max(MA_LONG, 80):
-                continue
-            df = build_indicators(df)
-            for sk in strategy_keys:
-                res = summarize_strategy(names.get(t, t), t, df, sk, currency)
-                results.append(res)
-        except Exception as e:
-            fetch_fail += 1
-            print(f"  [스킵] {t}: {e}")
-        time.sleep(0.05)
-        if (i + 1) % 20 == 0:
-            print(f"  ...{i+1}/{len(tickers)} 처리 중")
+    total = len(tickers)
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_map = {
+            ex.submit(_process_one, t, names.get(t, t), fetch, strategy_keys, currency): t
+            for t in tickers
+        }
+        for fut in as_completed(future_map):
+            t = future_map[fut]
+            done += 1
+            try:
+                results.extend(fut.result())
+            except Exception as e:
+                fetch_fail += 1
+                print(f"  [스킵] {t}: {e}")
+            if progress_callback:
+                progress_callback(done, total)
 
     if fetch_fail == len(tickers) and len(tickers) > 0:
         raise RuntimeError(
