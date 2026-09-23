@@ -167,14 +167,26 @@ def summarize(name, ticker, df, currency="원"):
 def get_kr_universe(top_n=100):
     from pykrx import stock
     today = pd.Timestamp.today()
+    cap = None
+    last_error = None
     for back in range(10):  # 최근 영업일 찾기
         date_str = (today - pd.Timedelta(days=back)).strftime("%Y%m%d")
         try:
-            cap = stock.get_market_cap_by_ticker(date_str, market="ALL")
-            if len(cap) > 0:
+            result = stock.get_market_cap_by_ticker(date_str, market="ALL")
+            if result is not None and len(result) > 0:
+                cap = result
                 break
-        except Exception:
+        except Exception as e:
+            last_error = e
             continue
+
+    if cap is None or len(cap) == 0:
+        raise RuntimeError(
+            "KRX 시가총액 데이터를 가져오지 못했습니다. "
+            "(Streamlit Cloud 서버에서 KRX 접속이 막혔거나 일시적으로 응답이 없을 수 있습니다. "
+            f"마지막 에러: {last_error})"
+        )
+
     cap = cap.sort_values("시가총액", ascending=False).head(top_n)
     tickers = cap.index.tolist()
     names = {t: stock.get_market_ticker_name(t) for t in tickers}
