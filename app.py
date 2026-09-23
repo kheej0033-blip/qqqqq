@@ -84,8 +84,16 @@ def winrate_badge(n, win_rate):
 
 if run:
     with st.spinner(f"{top_n}개 종목 스캔 중... (몇 분 걸릴 수 있어요)"):
-        results = run_scan(market_map[market], top_n)
-    st.session_state["results"] = results
+        try:
+            results = run_scan(market_map[market], top_n)
+            st.session_state["results"] = results
+        except Exception as e:
+            st.error(f"데이터를 가져오는 중 문제가 발생했습니다: {e}")
+            st.info(
+                "국내 데이터(KRX)는 클라우드 서버 IP에서 접속이 간헐적으로 막힐 수 있습니다. "
+                "'해외(S&P100)만'으로 먼저 테스트해보시거나, 잠시 후 다시 시도해보세요."
+            )
+            st.stop()
 
 if "results" not in st.session_state:
     st.info("왼쪽에서 조건을 정하고 '스캔 실행'을 눌러주세요.")
