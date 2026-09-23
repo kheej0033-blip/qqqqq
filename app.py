@@ -6,6 +6,7 @@
 
 import streamlit as st
 import pandas as pd
+import time as _time
 import screener as sc
 
 st.set_page_config(page_title="매매 신호 스크리너", page_icon="📈", layout="wide")
@@ -36,6 +37,18 @@ h1, h2, h3 { color: #e7e5df; }
 .badge-good { background: #1c3a2c; color: #4fbf8f; }
 .badge-warn { background: #3a2e1c; color: #e0a84f; }
 .badge-low  { background: #241c1c; color: #6b7078; }
+.multi-badge {
+    display: inline-block; font-size: 12px; font-weight: 600; padding: 4px 10px;
+    border-radius: 6px; background: #2a3a1c; color: #a8d94f; margin-bottom: 6px;
+}
+.strategy-block {
+    border-top: 1px solid #21252d; margin-top: 12px; padding-top: 12px;
+}
+.strategy-block:first-of-type { border-top: none; margin-top: 4px; padding-top: 4px; }
+.strategy-block-label { font-size: 12px; color: #6ea8f0; font-weight: 500; margin-bottom: 6px; }
+.wr-high { color: #4fbf8f; }
+.wr-mid  { color: #e0a84f; }
+.wr-low  { color: #e0685f; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -67,17 +80,6 @@ with st.sidebar:
     )
 
 market_map = {"전체": "all", "국내만": "kr", "해외(S&P100)만": "us"}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def run_scan_cached(market_key, top_n, strat_keys):
-    # progress bar 없이 캐시되는 버전 (재실행 시 즉시 반환)
-    results = []
-    if market_key in ("kr", "all"):
-        results += sc.scan_market("kr", top_n, strat_keys)
-    if market_key in ("us", "all"):
-        results += sc.scan_market("us", top_n, strat_keys)
-    return results
 
 
 def run_scan_with_progress(market_key, top_n, strat_keys):
@@ -113,6 +115,16 @@ def winrate_badge(n):
     return f'<span class="badge badge-good">과거 신호 {n}번 확인됨</span>'
 
 
+def winrate_color_class(win_rate):
+    if win_rate is None:
+        return "wr-mid"
+    if win_rate >= 80:
+        return "wr-high"
+    elif win_rate >= 50:
+        return "wr-mid"
+    return "wr-low"
+
+
 if run:
     if not selected_strats:
         st.warning("최소 1개 이상의 전략을 선택하세요.")
@@ -129,6 +141,7 @@ if run:
                 results = run_scan_with_progress(*cache_key)
                 st.session_state.setdefault("_scan_cache", {})[cache_key] = results
             st.session_state["results"] = results
+            st.session_state["scan_time"] = _time.strftime("%Y-%m-%d %H:%M:%S")
         except Exception as e:
             st.error(f"데이터를 가져오는 중 문제가 발생했습니다: {e}")
             st.info("국내 데이터가 계속 실패하면 '해외(S&P100)만'으로 먼저 테스트해보세요.")
@@ -139,45 +152,104 @@ if "results" not in st.session_state:
     st.stop()
 
 results = st.session_state["results"]
-active = [r for r in results if r["active_signal"]]
-active.sort(key=lambda r: (r["win_rate"] or 0), reverse=True)
 
-col1, col2, col3 = st.columns(3)
+if "scan_time" in st.session_state:
+    st.caption(
+        f"📅 데이터 기준 시각: {st.session_state['scan_time']} "
+        "(이 시각의 종가 기준이며, 실시간 시세가 아닙니다. 같은 세션에서 전략만 바꾸면 "
+        "이 시각 데이터를 재사용합니다 — 최신으로 갱신하려면 '최신 데이터로 새로고침' 체크)"
+    )
+
+# 같은 종목에 여러 전략이 동시에 신호를 낸 경우 하나로 묶기
+active = [r for r in results if r["active_signal"]]
+grouped = {}
+for r in active:
+    key = (r["ticker"], r["currency"])
+    grouped.setdefault(key, []).append(r)
+
+groups = list(grouped.values())
+
+col1, col2, col3, col4 = st.columns(4)
 col1.metric("스캔한 종목×전략", len(results))
-col2.metric("신호 활성", len(active))
-col3.metric("신호 없음", len(results) - len(active))
+col2.metric("신호 활성 종목", len(groups))
+multi_count = sum(1 for g in groups if len(g) > 1)
+col3.metric("2개 이상 전략 동시신호", multi_count)
+col4.metric("신호 없음", len(results) - len(active))
 
 st.divider()
 
-if not active:
+if not groups:
     st.warning("현재 조건에 맞는 신호가 없습니다. 전략을 더 선택하거나 종목 수를 늘려보세요.")
 else:
-    for r in active:
-        cur = r["currency"]
-        n = r["n_trades"]
-        wr_txt = f"{r['win_rate']:.0f}%" if r["win_rate"] is not None else "N/A"
-        avg_txt = f"{r['avg_ret']:+.1f}%" if r["avg_ret"] is not None else "N/A"
+    sort_option = st.selectbox(
+        "정렬 기준",
+        ["동시신호 많은순 → 승률순", "승률 높은순", "평균 수익률순", "종목명"],
+        index=0,
+    )
+
+    def group_best_winrate(g):
+        rates = [x["win_rate"] for x in g if x["win_rate"] is not None]
+        return max(rates) if rates else 0
+
+    def group_best_avgret(g):
+        rets = [x["avg_ret"] for x in g if x["avg_ret"] is not None]
+        return max(rets) if rets else -999
+
+    if sort_option == "동시신호 많은순 → 승률순":
+        groups.sort(key=lambda g: (len(g), group_best_winrate(g)), reverse=True)
+    elif sort_option == "승률 높은순":
+        groups.sort(key=group_best_winrate, reverse=True)
+    elif sort_option == "평균 수익률순":
+        groups.sort(key=group_best_avgret, reverse=True)
+    else:
+        groups.sort(key=lambda g: g[0]["name"])
+
+    for g in groups:
+        r0 = g[0]
+        cur = r0["currency"]
+        multi = len(g) > 1
+
+        badges_html = "".join(
+            f'<span class="strategy-badge">{x["strategy_label"]}</span> ' for x in g
+        )
+        header = (
+            f'<span class="multi-badge">⚡ {len(g)}개 전략 동시 신호</span><br>' if multi else ""
+        )
 
         st.markdown(f"""
         <div class="card">
-            <span class="strategy-badge">{r['strategy_label']}</span>
-            <div class="card-title">{r['name']} <span style="color:#5c616b; font-weight:400;">({r['ticker']})</span></div>
-            <div class="price-row">
-                <div class="price-box">
-                    <div class="price-label">매수 타점</div>
-                    <div class="price-value buy">{r['entry_price']:,.0f}{cur}</div>
-                </div>
-                <div class="price-box">
-                    <div class="price-label">매도 타점 (추정)</div>
-                    <div class="price-value sell">{r['target_price']:,.0f}{cur}</div>
-                </div>
-            </div>
-            <div class="reason">근거: {r['reason']}</div>
-            <div class="winrate-row">
-                과거 승률 <b>{wr_txt}</b> (평균 수익률 {avg_txt}) {winrate_badge(n)}
-            </div>
-        </div>
+            {header}
+            {badges_html}
+            <div class="card-title" style="margin-top:8px;">{r0['name']} <span style="color:#5c616b; font-weight:400;">({r0['ticker']})</span></div>
         """, unsafe_allow_html=True)
+
+        for x in g:
+            n = x["n_trades"]
+            wr_txt = f"{x['win_rate']:.0f}%" if x["win_rate"] is not None else "N/A"
+            avg_txt = f"{x['avg_ret']:+.1f}%" if x["avg_ret"] is not None else "N/A"
+            wr_class = winrate_color_class(x["win_rate"])
+
+            st.markdown(f"""
+            <div class="strategy-block">
+                <div class="strategy-block-label">{x['strategy_label']}</div>
+                <div class="price-row">
+                    <div class="price-box">
+                        <div class="price-label">매수 타점</div>
+                        <div class="price-value buy">{x['entry_price']:,.0f}{cur}</div>
+                    </div>
+                    <div class="price-box">
+                        <div class="price-label">매도 타점 (추정)</div>
+                        <div class="price-value sell">{x['target_price']:,.0f}{cur}</div>
+                    </div>
+                </div>
+                <div class="reason">근거: {x['reason']}</div>
+                <div class="winrate-row">
+                    과거 승률 <b class="{wr_class}">{wr_txt}</b> (평균 수익률 {avg_txt}) {winrate_badge(n)}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
 with st.expander("전체 결과 (신호 없는 것 포함)"):
     df = pd.DataFrame(results)
