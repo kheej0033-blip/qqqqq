@@ -372,19 +372,21 @@ def get_us_ohlcv(ticker, years=2):
 
 # ---------- 실행 ----------
 
-def _process_one(ticker, name, fetch, strategy_keys, currency):
+def _fetch_and_build(ticker, fetch):
+    """시세 fetch + 지표 계산만 담당 (전략과 무관, 캐시 대상)."""
     df = fetch(ticker)
     if len(df) < max(MA_LONG, 80):
-        return []
-    df = build_indicators(df)
-    return [summarize_strategy(name, ticker, df, sk, currency) for sk in strategy_keys]
+        return None
+    return build_indicators(df)
 
 
-def scan_market(market, top_n, strategy_keys=None, progress_callback=None, max_workers=8):
+def scan_market(market, top_n, strategy_keys=None, progress_callback=None, max_workers=8, df_cache=None):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     if strategy_keys is None:
         strategy_keys = list(STRATEGIES.keys())
+    if df_cache is None:
+        df_cache = {}
 
     if market == "kr":
         tickers, names = get_kr_universe(top_n)
@@ -401,23 +403,37 @@ def scan_market(market, top_n, strategy_keys=None, progress_callback=None, max_w
     total = len(tickers)
     done = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        future_map = {
-            ex.submit(_process_one, t, names.get(t, t), fetch, strategy_keys, currency): t
-            for t in tickers
-        }
-        for fut in as_completed(future_map):
-            t = future_map[fut]
-            done += 1
-            try:
-                results.extend(fut.result())
-            except Exception as e:
-                fetch_fail += 1
-                print(f"  [스킵] {t}: {e}")
-            if progress_callback:
-                progress_callback(done, total)
+    to_fetch = [t for t in tickers if (market, t) not in df_cache]
+    already_cached = [t for t in tickers if (market, t) in df_cache]
 
-    if fetch_fail == len(tickers) and len(tickers) > 0:
+    # 이미 캐시된 건 네트워크 없이 바로 전략만 계산
+    for t in already_cached:
+        done += 1
+        df = df_cache[(market, t)]
+        if df is not None:
+            results.extend([summarize_strategy(names.get(t, t), t, df, sk, currency) for sk in strategy_keys])
+        if progress_callback:
+            progress_callback(done, total)
+
+    if to_fetch:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {ex.submit(_fetch_and_build, t, fetch): t for t in to_fetch}
+            for fut in as_completed(future_map):
+                t = future_map[fut]
+                done += 1
+                try:
+                    df = fut.result()
+                    df_cache[(market, t)] = df
+                    if df is not None:
+                        results.extend([summarize_strategy(names.get(t, t), t, df, sk, currency) for sk in strategy_keys])
+                except Exception as e:
+                    fetch_fail += 1
+                    df_cache[(market, t)] = None
+                    print(f"  [스킵] {t}: {e}")
+                if progress_callback:
+                    progress_callback(done, total)
+
+    if fetch_fail == len(to_fetch) and len(to_fetch) > 0 and not already_cached:
         raise RuntimeError(
             f"{market.upper()} 시세를 {len(tickers)}개 종목 모두 가져오지 못했습니다. "
             "데이터 제공처가 서버 IP를 일시적으로 막고 있을 수 있습니다."
