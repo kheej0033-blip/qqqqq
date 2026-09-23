@@ -58,6 +58,7 @@ with st.sidebar:
     )
 
     run = st.button("🔍 스캔 실행", type="primary", use_container_width=True)
+    force_refresh = st.checkbox("최신 데이터로 새로고침 (캐시 무시)", value=False)
 
     st.divider()
     st.caption(
@@ -80,6 +81,10 @@ def run_scan_cached(market_key, top_n, strat_keys):
 
 
 def run_scan_with_progress(market_key, top_n, strat_keys):
+    if "_df_cache" not in st.session_state:
+        st.session_state["_df_cache"] = {}
+    df_cache = st.session_state["_df_cache"]
+
     progress_bar = st.progress(0, text="시작 중...")
     markets = [m for m in (["kr"] if market_key in ("kr", "all") else []) +
                (["us"] if market_key in ("us", "all") else [])]
@@ -93,7 +98,7 @@ def run_scan_with_progress(market_key, top_n, strat_keys):
             frac = (mi + done / max(total, 1)) / total_markets
             progress_bar.progress(min(frac, 1.0), text=f"{label} 스캔 중... ({done}/{total})")
 
-        results += sc.scan_market(m, top_n, strat_keys, progress_callback=cb)
+        results += sc.scan_market(m, top_n, strat_keys, progress_callback=cb, df_cache=df_cache)
 
     progress_bar.progress(1.0, text="완료")
     progress_bar.empty()
@@ -102,20 +107,23 @@ def run_scan_with_progress(market_key, top_n, strat_keys):
 
 def winrate_badge(n):
     if n < 5:
-        return f'<span class="badge badge-low">표본 매우 적음 (n={n})</span>'
+        return f'<span class="badge badge-low">과거 신호 {n}번뿐 — 통계적 의미 없음</span>'
     elif n < 10:
-        return f'<span class="badge badge-warn">참고용 (n={n})</span>'
-    return f'<span class="badge badge-good">n={n}</span>'
+        return f'<span class="badge badge-warn">과거 신호 {n}번 — 표본 부족, 신뢰하기 이름</span>'
+    return f'<span class="badge badge-good">과거 신호 {n}번 확인됨</span>'
 
 
 if run:
     if not selected_strats:
         st.warning("최소 1개 이상의 전략을 선택하세요.")
         st.stop()
+    if force_refresh:
+        st.session_state["_df_cache"] = {}
+        st.session_state["_scan_cache"] = {}
     with st.spinner(f"{top_n}개 종목 × {len(selected_strats)}개 전략 스캔 중... (몇 분 걸릴 수 있어요)"):
         try:
             cache_key = (market_map[market], top_n, tuple(selected_strats))
-            if cache_key in st.session_state.get("_scan_cache", {}):
+            if not force_refresh and cache_key in st.session_state.get("_scan_cache", {}):
                 results = st.session_state["_scan_cache"][cache_key]
             else:
                 results = run_scan_with_progress(*cache_key)
