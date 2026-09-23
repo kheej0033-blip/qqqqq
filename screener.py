@@ -203,19 +203,76 @@ def get_kr_ohlcv(ticker, years=2):
     return df[["open", "high", "low", "close", "volume"]]
 
 
+_SP100_FALLBACK = {
+    "AAPL": "Apple", "MSFT": "Microsoft", "NVDA": "NVIDIA", "AMZN": "Amazon",
+    "GOOGL": "Alphabet A", "GOOG": "Alphabet C", "META": "Meta Platforms",
+    "BRK-B": "Berkshire Hathaway", "AVGO": "Broadcom", "TSLA": "Tesla",
+    "LLY": "Eli Lilly", "JPM": "JPMorgan Chase", "V": "Visa", "XOM": "Exxon Mobil",
+    "UNH": "UnitedHealth", "MA": "Mastercard", "PG": "Procter & Gamble",
+    "COST": "Costco", "HD": "Home Depot", "JNJ": "Johnson & Johnson",
+    "ABBV": "AbbVie", "NFLX": "Netflix", "CRM": "Salesforce", "BAC": "Bank of America",
+    "KO": "Coca-Cola", "MRK": "Merck", "AMD": "AMD", "PEP": "PepsiCo",
+    "ADBE": "Adobe", "WMT": "Walmart", "CSCO": "Cisco", "TMO": "Thermo Fisher",
+    "MCD": "McDonald's", "ABT": "Abbott", "ACN": "Accenture", "LIN": "Linde",
+    "PM": "Philip Morris", "DHR": "Danaher", "WFC": "Wells Fargo", "GE": "GE Aerospace",
+    "TXN": "Texas Instruments", "QCOM": "Qualcomm", "IBM": "IBM", "VZ": "Verizon",
+    "CAT": "Caterpillar", "AMGN": "Amgen", "INTU": "Intuit", "NOW": "ServiceNow",
+    "SPGI": "S&P Global", "AXP": "American Express", "PFE": "Pfizer", "NKE": "Nike",
+    "UNP": "Union Pacific", "RTX": "RTX", "LOW": "Lowe's", "GS": "Goldman Sachs",
+    "T": "AT&T", "HON": "Honeywell", "BKNG": "Booking Holdings", "COP": "ConocoPhillips",
+    "ISRG": "Intuitive Surgical", "MS": "Morgan Stanley", "BLK": "BlackRock",
+    "SYK": "Stryker", "ELV": "Elevance Health", "SCHW": "Charles Schwab",
+    "MDT": "Medtronic", "C": "Citigroup", "MU": "Micron", "PLD": "Prologis",
+    "ADP": "ADP", "CVX": "Chevron", "GILD": "Gilead", "CI": "Cigna",
+    "CB": "Chubb", "TJX": "TJX", "MMC": "Marsh McLennan", "SBUX": "Starbucks",
+    "AMT": "American Tower", "PGR": "Progressive", "ETN": "Eaton",
+    "BSX": "Boston Scientific", "ADI": "Analog Devices", "DE": "Deere",
+    "LMT": "Lockheed Martin", "BA": "Boeing", "SO": "Southern Company",
+    "MDLZ": "Mondelez", "REGN": "Regeneron", "VRTX": "Vertex Pharma",
+    "PANW": "Palo Alto Networks", "ORCL": "Oracle", "DUK": "Duke Energy",
+    "TMUS": "T-Mobile", "CMCSA": "Comcast", "FI": "Fiserv", "EOG": "EOG Resources",
+    "SHW": "Sherwin-Williams", "ZTS": "Zoetis", "CME": "CME Group",
+    "MO": "Altria", "NEE": "NextEra Energy", "APD": "Air Products",
+    "PYPL": "PayPal", "TGT": "Target", "USB": "US Bancorp", "KLAC": "KLA Corp",
+}
+
+
 def get_us_universe():
-    tables = pd.read_html("https://en.wikipedia.org/wiki/S%26P_100")
-    for t in tables:
-        if "Symbol" in t.columns:
-            tickers = t["Symbol"].str.replace(".", "-", regex=False).tolist()
-            names = dict(zip(tickers, t["Name" if "Name" in t.columns else t.columns[1]]))
-            return tickers, names
-    raise RuntimeError("S&P100 목록 파싱 실패")
+    import requests
+    from io import StringIO
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+    }
+    try:
+        resp = requests.get("https://en.wikipedia.org/wiki/S%26P_100", headers=headers, timeout=10)
+        resp.raise_for_status()
+        tables = pd.read_html(StringIO(resp.text))
+        for t in tables:
+            if "Symbol" in t.columns:
+                tickers = t["Symbol"].str.replace(".", "-", regex=False).tolist()
+                name_col = "Name" if "Name" in t.columns else "Company"
+                names = dict(zip(tickers, t[name_col])) if name_col in t.columns else {tk: tk for tk in tickers}
+                return tickers, names
+    except Exception as e:
+        print(f"  [경고] 위키피디아에서 S&P100 목록을 못 가져와 내장 목록으로 대체합니다: {e}")
+
+    return list(_SP100_FALLBACK.keys()), _SP100_FALLBACK
 
 
 def get_us_ohlcv(ticker, years=2):
     import yfinance as yf
-    df = yf.download(ticker, period=f"{years}y", interval="1d", progress=False)
+    import requests
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+    })
+    try:
+        df = yf.download(ticker, period=f"{years}y", interval="1d", progress=False, session=session)
+    except TypeError:
+        # 일부 yfinance 버전은 session 인자를 지원하지 않음
+        df = yf.download(ticker, period=f"{years}y", interval="1d", progress=False)
     df = df.rename(columns={"Open": "open", "High": "high", "Low": "low",
                              "Close": "close", "Volume": "volume"})
     if isinstance(df.columns, pd.MultiIndex):
@@ -237,6 +294,7 @@ def scan_market(market, top_n):
         fetch = get_us_ohlcv
         currency = "$"
 
+    fetch_fail = 0
     for i, t in enumerate(tickers):
         try:
             df = fetch(t)
@@ -247,10 +305,17 @@ def scan_market(market, top_n):
             res["currency"] = currency
             results.append(res)
         except Exception as e:
+            fetch_fail += 1
             print(f"  [스킵] {t}: {e}")
         time.sleep(0.05)
         if (i + 1) % 20 == 0:
             print(f"  ...{i+1}/{len(tickers)} 처리 중")
+
+    if fetch_fail == len(tickers) and len(tickers) > 0:
+        raise RuntimeError(
+            f"{market.upper()} 시세를 {len(tickers)}개 종목 모두 가져오지 못했습니다. "
+            "데이터 제공처(Yahoo Finance/KRX)가 서버 IP를 일시적으로 막고 있을 수 있습니다."
+        )
 
     return results
 
