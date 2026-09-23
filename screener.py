@@ -1,26 +1,13 @@
 #!/usr/bin/env python3
 """
-MFI + 슈퍼트렌드 + 거래량 조합 스크리너 & 종목별 과거 승률 백테스트
+멀티 전략 스크리너 - MFI단순 / MFI+슈퍼트렌드+거래량 콤보 / 골든크로스 / 거래량돌파
+각 종목에 대해 4개 전략을 모두 계산하고, 현재 신호가 걸린 것만 추려서 보여줍니다.
+각 전략의 "승률"은 그 종목·그 전략 조건으로 과거 실제 몇 번(n) 발생했는지 계산한 값입니다.
 
 설치:
     pip install pykrx yfinance pandas numpy requests lxml
-
-실행:
-    python screener.py                 # 국내 상위100 + S&P100 전체 스캔
-    python screener.py --market kr     # 국내만
-    python screener.py --market us     # 해외만
-    python screener.py --top 30        # 시총 상위 30개만 (테스트용, 빠름)
-
-중요:
-  - 이 스크립트가 보여주는 "승률"은 그 종목에 그 정확한 신호 조건이 과거에
-    몇 번 나왔고 결과가 어땠는지를 계산한 것입니다. 표본(n)이 작으면
-    (특히 n<10) 통계적으로 거의 의미가 없습니다. 반드시 n을 같이 확인하세요.
-  - 과거 승률이 좋았다고 미래도 같다는 보장은 없습니다. 투자 조언이 아닙니다.
-  - 상위 100 종목 리스트는 "현재 시점 기준"이라 과거로 갈수록 생존편향
-    (지금 잘나가는 종목만 보게 되는 편향)이 있을 수 있습니다.
 """
 
-import argparse
 import time
 import numpy as np
 import pandas as pd
@@ -28,12 +15,13 @@ import warnings
 warnings.filterwarnings("ignore")
 
 MFI_PERIOD = 14
-MFI_OVERSOLD = 30
-MFI_OVERBOUGHT = 70
 ST_PERIOD = 10
 ST_MULT = 3.0
 VOL_LOOKBACK = 20
-VOL_RATIO_MIN = 1.5   # 평균 거래량의 1.5배 이상
+MA_SHORT = 50
+MA_LONG = 200
+BREAKOUT_VOL_MULT = 2.5
+BREAKOUT_HOLD_DAYS = 7
 
 
 # ---------- 지표 계산 ----------
@@ -85,153 +73,147 @@ def compute_supertrend(df, period=ST_PERIOD, mult=ST_MULT):
         else:
             final_lower.iloc[i] = lower.iloc[i]
 
-    supertrend_line = np.where(trend == 1, final_lower, final_upper)
-    return pd.Series(supertrend_line, index=df.index), trend
+    return trend
 
 
-def build_signals(df):
+def build_indicators(df):
     df = df.copy()
     df["mfi"] = compute_mfi(df)
-    st_line, st_trend = compute_supertrend(df)
-    df["st_trend"] = st_trend
+    df["st_trend"] = compute_supertrend(df)
     df["vol_ma"] = df["volume"].rolling(VOL_LOOKBACK).mean()
     df["vol_ratio"] = df["volume"] / df["vol_ma"]
-
-    st_flip_up = (df["st_trend"] == 1) & (df["st_trend"].shift(1) == -1)
-    st_flip_down = (df["st_trend"] == 1).shift(1).fillna(False) & (df["st_trend"] == -1)
-
-    df["buy_signal"] = st_flip_up & (df["mfi"] < MFI_OVERSOLD + 15) & (df["vol_ratio"] > VOL_RATIO_MIN)
-    df["sell_signal"] = st_flip_down | (df["mfi"] > MFI_OVERBOUGHT)
+    df["ma_short"] = df["close"].rolling(MA_SHORT).mean()
+    df["ma_long"] = df["close"].rolling(MA_LONG).mean()
     return df
 
 
-def backtest_ticker(df):
-    """buy_signal 이후 다음 sell_signal까지의 수익률을 전부 모아 승률/평균수익률 계산."""
+# ---------- 전략 정의 ----------
+# 각 전략: entry(df)->bool Series, exit(df)->bool Series 또는 hold_days(고정 보유일)
+
+def _mfi_simple_entry(df):
+    return (df["mfi"] < 30) & (df["mfi"].shift(1) >= 30)
+
+def _mfi_simple_exit(df):
+    return df["mfi"] > 70
+
+
+def _combo_entry(df):
+    st_flip_up = (df["st_trend"] == 1) & (df["st_trend"].shift(1) == -1)
+    return st_flip_up & (df["mfi"] < 45) & (df["vol_ratio"] > 1.5)
+
+def _combo_exit(df):
+    st_flip_down = (df["st_trend"] == -1) & (df["st_trend"].shift(1) == 1)
+    return st_flip_down | (df["mfi"] > 70)
+
+
+def _golden_cross_entry(df):
+    return (df["ma_short"] > df["ma_long"]) & (df["ma_short"].shift(1) <= df["ma_long"].shift(1))
+
+def _golden_cross_exit(df):
+    return (df["ma_short"] < df["ma_long"]) & (df["ma_short"].shift(1) >= df["ma_long"].shift(1))
+
+
+def _volume_breakout_entry(df):
+    return (df["vol_ratio"] > BREAKOUT_VOL_MULT) & (df["close"] > df["close"].shift(1))
+
+
+STRATEGIES = {
+    "mfi_simple": {
+        "label": "MFI 단순 과매도",
+        "entry": _mfi_simple_entry,
+        "exit": _mfi_simple_exit,
+        "hold_days": None,
+        "reason": lambda row: f"MFI {row['mfi']:.1f} (과매도 진입)",
+    },
+    "combo": {
+        "label": "MFI+슈퍼트렌드+거래량 콤보",
+        "entry": _combo_entry,
+        "exit": _combo_exit,
+        "hold_days": None,
+        "reason": lambda row: f"MFI {row['mfi']:.1f} · 슈퍼트렌드 상승전환 · 거래량 {row['vol_ratio']:.1f}배",
+    },
+    "golden_cross": {
+        "label": "이동평균 골든크로스",
+        "entry": _golden_cross_entry,
+        "exit": _golden_cross_exit,
+        "hold_days": None,
+        "reason": lambda row: f"{MA_SHORT}일선이 {MA_LONG}일선 상향 돌파",
+    },
+    "volume_breakout": {
+        "label": "거래량 돌파",
+        "entry": _volume_breakout_entry,
+        "exit": None,
+        "hold_days": BREAKOUT_HOLD_DAYS,
+        "reason": lambda row: f"거래량 평균 대비 {row['vol_ratio']:.1f}배 급증 + 상승",
+    },
+}
+
+
+# ---------- 백테스트 (공통 엔진) ----------
+
+def backtest_strategy(df, strat):
+    entry_sig = strat["entry"](df)
+    hold_days = strat["hold_days"]
+    exit_fn = strat["exit"]
+
     trades = []
     in_position = False
     entry_price = None
-    entry_date = None
+    entry_idx = None
 
     for i in range(len(df)):
-        row = df.iloc[i]
-        if not in_position and row["buy_signal"]:
+        if not in_position and bool(entry_sig.iloc[i]):
             in_position = True
-            entry_price = row["close"]
-            entry_date = df.index[i]
-        elif in_position and row["sell_signal"]:
-            exit_price = row["close"]
-            ret = (exit_price - entry_price) / entry_price * 100
-            trades.append({"entry_date": entry_date, "exit_date": df.index[i],
-                            "entry": entry_price, "exit": exit_price, "ret": ret})
-            in_position = False
+            entry_price = df["close"].iloc[i]
+            entry_idx = i
+            continue
+
+        if in_position:
+            should_exit = False
+            if hold_days is not None:
+                should_exit = (i - entry_idx) >= hold_days
+            elif exit_fn is not None:
+                should_exit = bool(exit_fn(df).iloc[i])
+
+            if should_exit:
+                exit_price = df["close"].iloc[i]
+                ret = (exit_price - entry_price) / entry_price * 100
+                trades.append(ret)
+                in_position = False
 
     open_trade = None
     if in_position:
-        open_trade = {"entry_date": entry_date, "entry": entry_price}
+        open_trade = {"entry_price": entry_price, "entry_idx": entry_idx}
 
     return trades, open_trade
 
 
-def summarize(name, ticker, df, currency="원"):
-    trades, open_trade = backtest_ticker(df)
+def summarize_strategy(name, ticker, df, strat_key, currency):
+    strat = STRATEGIES[strat_key]
+    trades, open_trade = backtest_strategy(df, strat)
     n = len(trades)
-    if n == 0:
-        win_rate, avg_ret = None, None
-    else:
-        wins = sum(1 for t in trades if t["ret"] > 0)
-        win_rate = wins / n * 100
-        avg_ret = sum(t["ret"] for t in trades) / n
+    win_rate = (sum(1 for r in trades if r > 0) / n * 100) if n else None
+    avg_ret = (sum(trades) / n) if n else None
 
     result = {
-        "name": name, "ticker": ticker, "n_trades": n,
-        "win_rate": win_rate, "avg_ret": avg_ret,
+        "name": name, "ticker": ticker, "currency": currency,
+        "strategy": strat_key, "strategy_label": strat["label"],
+        "n_trades": n, "win_rate": win_rate, "avg_ret": avg_ret,
         "active_signal": open_trade is not None,
     }
-
     if open_trade:
-        entry = open_trade["entry"]
+        entry = open_trade["entry_price"]
         result["entry_price"] = entry
         if avg_ret and avg_ret > 0:
             result["target_price"] = entry * (1 + avg_ret / 100)
         else:
-            recent_high = df["high"].tail(60).max()
-            result["target_price"] = recent_high
-        result["mfi_now"] = df["mfi"].iloc[-1]
-        result["vol_ratio_now"] = df["vol_ratio"].iloc[-1]
-
+            result["target_price"] = df["high"].tail(60).max()
+        last_row = df.iloc[-1]
+        result["reason"] = strat["reason"](last_row)
     return result
 
 
-# ---------- 데이터 소스 ----------
-
-_KOSPI_TOP_FALLBACK = {
-    "005930": "삼성전자", "000660": "SK하이닉스", "373220": "LG에너지솔루션",
-    "207940": "삼성바이오로직스", "005380": "현대차", "000270": "기아",
-    "068270": "셀트리온", "035420": "NAVER", "051910": "LG화학",
-    "006400": "삼성SDI", "035720": "카카오", "105560": "KB금융",
-    "055550": "신한지주", "012330": "현대모비스", "028260": "삼성물산",
-    "066570": "LG전자", "015760": "한국전력", "034730": "SK",
-    "018260": "삼성에스디에스", "032830": "삼성생명", "086790": "하나금융지주",
-    "010130": "고려아연", "009150": "삼성전기", "259960": "크래프톤",
-    "003550": "LG", "017670": "SK텔레콤", "316140": "우리금융지주",
-    "030200": "KT", "024110": "기업은행", "090430": "아모레퍼시픽",
-    "011070": "LG이노텍", "010950": "S-Oil", "005490": "POSCO홀딩스",
-    "000810": "삼성화재", "042700": "한미반도체", "267250": "HD현대중공업",
-    "010140": "삼성중공업", "097950": "CJ제일제당", "051900": "LG생활건강",
-    "000720": "현대건설", "004020": "현대제철", "006800": "미래에셋증권",
-    "023530": "롯데쇼핑", "096770": "SK이노베이션", "302440": "SK바이오사이언스",
-    "011200": "HMM", "009540": "HD한국조선해양", "003670": "포스코퓨처엠",
-    "047050": "포스코인터내셔널", "128940": "한미약품", "180640": "한진칼",
-    "009830": "DL", "010620": "HD현대미포", "251270": "넷마블",
-    "352820": "하이브", "091990": "셀트리온헬스케어", "058470": "리노공업",
-    "393890": "더존비즈온", "064350": "현대로템", "329180": "HD현대중공업우",
-    "323410": "카카오뱅크", "018880": "한온시스템", "138040": "메리츠금융지주",
-    "004990": "롯데지주", "071050": "한국금융지주", "016360": "삼성증권",
-    "000100": "유한양행", "139480": "이마트", "078930": "GS",
-    "021240": "코웨이", "029780": "삼성카드", "088350": "한화생명",
-    "047810": "한국항공우주", "241560": "두산밥캣", "034020": "두산에너빌리티",
-    "336260": "두산퓨얼셀", "112610": "씨에스윈드", "298050": "효성첨단소재",
-    "011780": "금호석유", "016380": "KG스틸", "004370": "농심",
-    "001040": "CJ", "271560": "오리온", "008930": "한미사이언스",
-}
-
-
-def get_kr_universe(top_n=100):
-    from pykrx import stock
-    today = pd.Timestamp.today()
-    cap = None
-    last_error = None
-    for back in range(10):  # 최근 영업일 찾기
-        date_str = (today - pd.Timedelta(days=back)).strftime("%Y%m%d")
-        try:
-            result = stock.get_market_cap_by_ticker(date_str, market="ALL")
-            if result is not None and len(result) > 0:
-                cap = result
-                break
-        except Exception as e:
-            last_error = e
-            continue
-
-    if cap is not None and len(cap) > 0:
-        cap = cap.sort_values("시가총액", ascending=False).head(top_n)
-        tickers = cap.index.tolist()
-        names = {t: stock.get_market_ticker_name(t) for t in tickers}
-        return tickers, names
-
-    print(f"  [경고] KRX 시가총액 실시간 조회 실패, 내장 목록으로 대체합니다: {last_error}")
-    tickers = list(_KOSPI_TOP_FALLBACK.keys())[:top_n]
-    return tickers, _KOSPI_TOP_FALLBACK
-
-
-def get_kr_ohlcv(ticker, years=2):
-    from pykrx import stock
-    end = pd.Timestamp.today().strftime("%Y%m%d")
-    start = (pd.Timestamp.today() - pd.Timedelta(days=365 * years)).strftime("%Y%m%d")
-    df = stock.get_market_ohlcv(start, end, ticker)
-    df = df.rename(columns={"시가": "open", "고가": "high", "저가": "low",
-                             "종가": "close", "거래량": "volume"})
-    return df[["open", "high", "low", "close", "volume"]]
-
+# ---------- 종목 유니버스 ----------
 
 _SP100_FALLBACK = {
     "AAPL": "Apple", "MSFT": "Microsoft", "NVDA": "NVIDIA", "AMZN": "Amazon",
@@ -266,14 +248,77 @@ _SP100_FALLBACK = {
     "PYPL": "PayPal", "TGT": "Target", "USB": "US Bancorp", "KLAC": "KLA Corp",
 }
 
+_KOSPI_TOP_FALLBACK = {
+    "005930": "삼성전자", "000660": "SK하이닉스", "373220": "LG에너지솔루션",
+    "207940": "삼성바이오로직스", "005380": "현대차", "000270": "기아",
+    "068270": "셀트리온", "035420": "NAVER", "051910": "LG화학",
+    "006400": "삼성SDI", "035720": "카카오", "105560": "KB금융",
+    "055550": "신한지주", "012330": "현대모비스", "028260": "삼성물산",
+    "066570": "LG전자", "015760": "한국전력", "034730": "SK",
+    "018260": "삼성에스디에스", "032830": "삼성생명", "086790": "하나금융지주",
+    "010130": "고려아연", "009150": "삼성전기", "259960": "크래프톤",
+    "003550": "LG", "017670": "SK텔레콤", "316140": "우리금융지주",
+    "030200": "KT", "024110": "기업은행", "090430": "아모레퍼시픽",
+    "011070": "LG이노텍", "010950": "S-Oil", "005490": "POSCO홀딩스",
+    "000810": "삼성화재", "042700": "한미반도체", "267250": "HD현대중공업",
+    "010140": "삼성중공업", "097950": "CJ제일제당", "051900": "LG생활건강",
+    "000720": "현대건설", "004020": "현대제철", "006800": "미래에셋증권",
+    "023530": "롯데쇼핑", "096770": "SK이노베이션", "302440": "SK바이오사이언스",
+    "011200": "HMM", "009540": "HD한국조선해양", "003670": "포스코퓨처엠",
+    "047050": "포스코인터내셔널", "128940": "한미약품", "180640": "한진칼",
+    "009830": "DL", "010620": "HD현대미포", "251270": "넷마블",
+    "352820": "하이브", "091990": "셀트리온헬스케어", "058470": "리노공업",
+    "393890": "더존비즈온", "064350": "현대로템", "323410": "카카오뱅크",
+    "018880": "한온시스템", "138040": "메리츠금융지주", "004990": "롯데지주",
+    "071050": "한국금융지주", "016360": "삼성증권", "000100": "유한양행",
+    "139480": "이마트", "078930": "GS", "021240": "코웨이",
+    "029780": "삼성카드", "088350": "한화생명", "047810": "한국항공우주",
+    "241560": "두산밥캣", "034020": "두산에너빌리티", "336260": "두산퓨얼셀",
+    "112610": "씨에스윈드", "298050": "효성첨단소재", "011780": "금호석유",
+    "004370": "농심", "001040": "CJ", "271560": "오리온", "008930": "한미사이언스",
+}
+
+
+def get_kr_universe(top_n=100):
+    from pykrx import stock
+    today = pd.Timestamp.today()
+    cap, last_error = None, None
+    for back in range(10):
+        date_str = (today - pd.Timedelta(days=back)).strftime("%Y%m%d")
+        try:
+            result = stock.get_market_cap_by_ticker(date_str, market="ALL")
+            if result is not None and len(result) > 0:
+                cap = result
+                break
+        except Exception as e:
+            last_error = e
+
+    if cap is not None and len(cap) > 0:
+        cap = cap.sort_values("시가총액", ascending=False).head(top_n)
+        tickers = cap.index.tolist()
+        names = {t: stock.get_market_ticker_name(t) for t in tickers}
+        return tickers, names
+
+    print(f"  [경고] KRX 실시간 조회 실패, 내장 목록으로 대체: {last_error}")
+    tickers = list(_KOSPI_TOP_FALLBACK.keys())[:top_n]
+    return tickers, _KOSPI_TOP_FALLBACK
+
+
+def get_kr_ohlcv(ticker, years=2):
+    from pykrx import stock
+    end = pd.Timestamp.today().strftime("%Y%m%d")
+    start = (pd.Timestamp.today() - pd.Timedelta(days=365 * years)).strftime("%Y%m%d")
+    df = stock.get_market_ohlcv(start, end, ticker)
+    df = df.rename(columns={"시가": "open", "고가": "high", "저가": "low",
+                             "종가": "close", "거래량": "volume"})
+    return df[["open", "high", "low", "close", "volume"]]
+
 
 def get_us_universe():
     import requests
     from io import StringIO
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-    }
+    headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")}
     try:
         resp = requests.get("https://en.wikipedia.org/wiki/S%26P_100", headers=headers, timeout=10)
         resp.raise_for_status()
@@ -285,8 +330,7 @@ def get_us_universe():
                 names = dict(zip(tickers, t[name_col])) if name_col in t.columns else {tk: tk for tk in tickers}
                 return tickers, names
     except Exception as e:
-        print(f"  [경고] 위키피디아에서 S&P100 목록을 못 가져와 내장 목록으로 대체합니다: {e}")
-
+        print(f"  [경고] 위키피디아 조회 실패, 내장 목록으로 대체: {e}")
     return list(_SP100_FALLBACK.keys()), _SP100_FALLBACK
 
 
@@ -294,14 +338,11 @@ def get_us_ohlcv(ticker, years=2):
     import yfinance as yf
     import requests
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-    })
+    session.headers.update({"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")})
     try:
         df = yf.download(ticker, period=f"{years}y", interval="1d", progress=False, session=session)
     except TypeError:
-        # 일부 yfinance 버전은 session 인자를 지원하지 않음
         df = yf.download(ticker, period=f"{years}y", interval="1d", progress=False)
     df = df.rename(columns={"Open": "open", "High": "high", "Low": "low",
                              "Close": "close", "Volume": "volume"})
@@ -312,7 +353,10 @@ def get_us_ohlcv(ticker, years=2):
 
 # ---------- 실행 ----------
 
-def scan_market(market, top_n):
+def scan_market(market, top_n, strategy_keys=None):
+    if strategy_keys is None:
+        strategy_keys = list(STRATEGIES.keys())
+
     results = []
     if market == "kr":
         tickers, names = get_kr_universe(top_n)
@@ -328,12 +372,12 @@ def scan_market(market, top_n):
     for i, t in enumerate(tickers):
         try:
             df = fetch(t)
-            if len(df) < 80:
+            if len(df) < max(MA_LONG, 80):
                 continue
-            df = build_signals(df)
-            res = summarize(names.get(t, t), t, df, currency)
-            res["currency"] = currency
-            results.append(res)
+            df = build_indicators(df)
+            for sk in strategy_keys:
+                res = summarize_strategy(names.get(t, t), t, df, sk, currency)
+                results.append(res)
         except Exception as e:
             fetch_fail += 1
             print(f"  [스킵] {t}: {e}")
@@ -344,9 +388,8 @@ def scan_market(market, top_n):
     if fetch_fail == len(tickers) and len(tickers) > 0:
         raise RuntimeError(
             f"{market.upper()} 시세를 {len(tickers)}개 종목 모두 가져오지 못했습니다. "
-            "데이터 제공처(Yahoo Finance/KRX)가 서버 IP를 일시적으로 막고 있을 수 있습니다."
+            "데이터 제공처가 서버 IP를 일시적으로 막고 있을 수 있습니다."
         )
-
     return results
 
 
@@ -354,43 +397,26 @@ def print_report(results):
     active = [r for r in results if r["active_signal"]]
     active.sort(key=lambda r: (r["win_rate"] or 0), reverse=True)
 
-    print("\n" + "=" * 70)
-    print(f"현재 매수 신호 활성 종목: {len(active)}개")
-    print("=" * 70)
-
+    print(f"\n현재 신호 활성: {len(active)}건 (종목×전략 조합 기준)")
     for r in active:
         cur = r["currency"]
-        n = r["n_trades"]
         wr = f"{r['win_rate']:.0f}%" if r["win_rate"] is not None else "N/A"
-        avg = f"{r['avg_ret']:+.1f}%" if r["avg_ret"] is not None else "N/A"
-        reliability = "⚠️ 표본 부족" if n < 10 else ""
-
-        print(f"\n종목: {r['name']} ({r['ticker']})")
-        print(f"  매수 타점: {r['entry_price']:,.0f}{cur}")
-        print(f"  매도 타점: {r['target_price']:,.0f}{cur}  (과거 평균수익률 기반 추정)")
-        print(f"  근거: MFI {r['mfi_now']:.1f} (슈퍼트렌드 상승전환 + 거래량 {r['vol_ratio_now']:.1f}배)")
-        print(f"  과거 승률: {wr} (n={n}건, 평균수익률 {avg}) {reliability}")
-
-    skipped_no_signal = len(results) - len(active)
-    print(f"\n(신호 없는 종목 {skipped_no_signal}개는 생략)")
+        print(f"\n[{r['strategy_label']}] {r['name']} ({r['ticker']})")
+        print(f"  매수: {r['entry_price']:,.0f}{cur} / 매도: {r['target_price']:,.0f}{cur}")
+        print(f"  근거: {r['reason']}")
+        print(f"  과거 승률: {wr} (n={r['n_trades']})")
 
 
-def main():
+if __name__ == "__main__":
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--market", choices=["kr", "us", "all"], default="all")
-    parser.add_argument("--top", type=int, default=100)
+    parser.add_argument("--top", type=int, default=30)
     args = parser.parse_args()
 
     all_results = []
     if args.market in ("kr", "all"):
-        print("국내 상위 종목 스캔 중...")
         all_results += scan_market("kr", args.top)
     if args.market in ("us", "all"):
-        print("S&P100 스캔 중...")
         all_results += scan_market("us", args.top)
-
     print_report(all_results)
-
-
-if __name__ == "__main__":
-    main()
