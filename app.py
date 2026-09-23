@@ -69,12 +69,34 @@ market_map = {"전체": "all", "국내만": "kr", "해외(S&P100)만": "us"}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def run_scan(market_key, top_n, strat_keys):
+def run_scan_cached(market_key, top_n, strat_keys):
+    # progress bar 없이 캐시되는 버전 (재실행 시 즉시 반환)
     results = []
     if market_key in ("kr", "all"):
         results += sc.scan_market("kr", top_n, strat_keys)
     if market_key in ("us", "all"):
         results += sc.scan_market("us", top_n, strat_keys)
+    return results
+
+
+def run_scan_with_progress(market_key, top_n, strat_keys):
+    progress_bar = st.progress(0, text="시작 중...")
+    markets = [m for m in (["kr"] if market_key in ("kr", "all") else []) +
+               (["us"] if market_key in ("us", "all") else [])]
+    total_markets = len(markets)
+    results = []
+
+    for mi, m in enumerate(markets):
+        label = "국내" if m == "kr" else "해외(S&P100)"
+
+        def cb(done, total, m=m, mi=mi):
+            frac = (mi + done / max(total, 1)) / total_markets
+            progress_bar.progress(min(frac, 1.0), text=f"{label} 스캔 중... ({done}/{total})")
+
+        results += sc.scan_market(m, top_n, strat_keys, progress_callback=cb)
+
+    progress_bar.progress(1.0, text="완료")
+    progress_bar.empty()
     return results
 
 
@@ -92,7 +114,12 @@ if run:
         st.stop()
     with st.spinner(f"{top_n}개 종목 × {len(selected_strats)}개 전략 스캔 중... (몇 분 걸릴 수 있어요)"):
         try:
-            results = run_scan(market_map[market], top_n, tuple(selected_strats))
+            cache_key = (market_map[market], top_n, tuple(selected_strats))
+            if cache_key in st.session_state.get("_scan_cache", {}):
+                results = st.session_state["_scan_cache"][cache_key]
+            else:
+                results = run_scan_with_progress(*cache_key)
+                st.session_state.setdefault("_scan_cache", {})[cache_key] = results
             st.session_state["results"] = results
         except Exception as e:
             st.error(f"데이터를 가져오는 중 문제가 발생했습니다: {e}")
