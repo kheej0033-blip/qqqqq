@@ -22,6 +22,9 @@ MA_SHORT = 50
 MA_LONG = 200
 BREAKOUT_VOL_MULT = 2.5
 BREAKOUT_HOLD_DAYS = 7
+NEW_HIGH_LOOKBACK = 252   # 약 1년(거래일 기준) 신고가
+NEW_HIGH_HOLD_DAYS = 20
+NEW_HIGH_VOL_MIN = 1.2
 
 
 # ---------- 지표 계산 ----------
@@ -86,6 +89,7 @@ def build_indicators(df):
     df["vol_ratio"] = df["volume"] / df["vol_ma"]
     df["ma_short"] = df["close"].rolling(MA_SHORT).mean()
     df["ma_long"] = df["close"].rolling(MA_LONG).mean()
+    df["rolling_high"] = df["close"].rolling(NEW_HIGH_LOOKBACK, min_periods=20).max()
     return df
 
 
@@ -119,6 +123,12 @@ def _volume_breakout_entry(df):
     return (df["vol_ratio"] > BREAKOUT_VOL_MULT) & (df["close"] > df["close"].shift(1))
 
 
+def _new_high_entry(df):
+    # 어제까지의 롤링 신고가를 오늘 종가가 갱신 + 거래량 동반
+    prev_high = df["rolling_high"].shift(1)
+    return (df["close"] > prev_high) & (df["vol_ratio"] > NEW_HIGH_VOL_MIN)
+
+
 STRATEGIES = {
     "mfi_simple": {
         "label": "MFI 단순 과매도",
@@ -147,6 +157,13 @@ STRATEGIES = {
         "exit": None,
         "hold_days": BREAKOUT_HOLD_DAYS,
         "reason": lambda row: f"거래량 평균 대비 {row['vol_ratio']:.1f}배 급증 + 상승",
+    },
+    "new_high": {
+        "label": "52주 신고가 돌파",
+        "entry": _new_high_entry,
+        "exit": None,
+        "hold_days": NEW_HIGH_HOLD_DAYS,
+        "reason": lambda row: f"약 1년 신고가 경신 · 거래량 평균 대비 {row['vol_ratio']:.1f}배",
     },
 }
 
