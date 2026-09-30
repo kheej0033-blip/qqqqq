@@ -32,7 +32,7 @@ h1, h2, h3 { color: #e7e5df; }
 .buy { color: #4fbf8f; }
 .sell { color: #e0685f; }
 .reason { font-size: 13px; color: #a8acb3; margin-bottom: 10px; line-height: 1.5; }
-.winrate-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.winrate-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #c3c6cc; }
 .badge { font-size: 11px; padding: 2px 8px; border-radius: 6px; font-weight: 500; }
 .badge-good { background: #1c3a2c; color: #4fbf8f; }
 .badge-warn { background: #3a2e1c; color: #e0a84f; }
@@ -133,6 +133,17 @@ def winrate_color_class(win_rate):
     return "wr-low"
 
 
+def render(html):
+    """
+    멀티라인 f-string 안에 조건부로 빈 문자열이 끼면(예: header="") 그 자리가
+    '공백만 있는 줄'이 되고, 마크다운이 그걸 blank line으로 인식해서 그 뒤
+    HTML을 코드블록으로 깨버리는 문제가 있었음. 모든 줄을 strip해서 한 줄로
+    합쳐버리면 이 문제가 원천적으로 발생하지 않음.
+    """
+    line = "".join(s.strip() for s in html.strip().splitlines())
+    st.markdown(line, unsafe_allow_html=True)
+
+
 if run:
     if not selected_strats:
         st.warning("최소 1개 이상의 전략을 선택하세요.")
@@ -213,51 +224,53 @@ else:
         groups.sort(key=lambda g: g[0]["name"])
 
     for g in groups:
-        r0 = g[0]
-        cur = r0["currency"]
-        multi = len(g) > 1
+        try:
+            r0 = g[0]
+            cur = r0["currency"]
+            multi = len(g) > 1
 
-        badges_html = "".join(
-            f'<span class="strategy-badge">{x["strategy_label"]}</span> ' for x in g
-        )
-        header = (
-            f'<span class="multi-badge">⚡ {len(g)}개 전략 동시 신호</span><br>' if multi else ""
-        )
+            badges_html = "".join(
+                f'<span class="strategy-badge">{x["strategy_label"]}</span> ' for x in g
+            )
+            header = (
+                f'<span class="multi-badge">⚡ {len(g)}개 전략 동시 신호</span><br>' if multi else ""
+            )
 
-        st.markdown(f"""
-        <div class="card">
-            {header}
-            {badges_html}
-            <div class="card-title" style="margin-top:8px;">{r0['name']} <span style="color:#5c616b; font-weight:400;">({r0['ticker']})</span></div>
-        """, unsafe_allow_html=True)
+            card_html = f"""
+            <div class="card">
+                {header}
+                {badges_html}
+                <div class="card-title" style="margin-top:8px;">{r0['name']} <span style="color:#5c616b; font-weight:400;">({r0['ticker']})</span></div>
+            """
+            for x in g:
+                n = x["n_trades"]
+                wr_txt = f"{x['win_rate']:.0f}%" if x["win_rate"] is not None else "N/A"
+                avg_txt = f"{x['avg_ret']:+.1f}%" if x["avg_ret"] is not None else "N/A"
+                wr_class = winrate_color_class(x["win_rate"])
 
-        for x in g:
-            n = x["n_trades"]
-            wr_txt = f"{x['win_rate']:.0f}%" if x["win_rate"] is not None else "N/A"
-            avg_txt = f"{x['avg_ret']:+.1f}%" if x["avg_ret"] is not None else "N/A"
-            wr_class = winrate_color_class(x["win_rate"])
-
-            st.markdown(f"""
-            <div class="strategy-block">
-                <div class="strategy-block-label">{x['strategy_label']}</div>
-                <div class="price-row">
-                    <div class="price-box">
-                        <div class="price-label">매수 타점</div>
-                        <div class="price-value buy">{x['entry_price']:,.0f}{cur}</div>
+                card_html += f"""
+                <div class="strategy-block">
+                    <div class="strategy-block-label">{x['strategy_label']}</div>
+                    <div class="price-row">
+                        <div class="price-box">
+                            <div class="price-label">매수 타점</div>
+                            <div class="price-value buy">{x['entry_price']:,.0f}{cur}</div>
+                        </div>
+                        <div class="price-box">
+                            <div class="price-label">매도 타점 (추정)</div>
+                            <div class="price-value sell">{x['target_price']:,.0f}{cur}</div>
+                        </div>
                     </div>
-                    <div class="price-box">
-                        <div class="price-label">매도 타점 (추정)</div>
-                        <div class="price-value sell">{x['target_price']:,.0f}{cur}</div>
+                    <div class="reason">근거: {x['reason']}</div>
+                    <div class="winrate-row">
+                        과거 승률 <b class="{wr_class}">{wr_txt}</b> (평균 수익률 {avg_txt}) {winrate_badge(n)}
                     </div>
                 </div>
-                <div class="reason">근거: {x['reason']}</div>
-                <div class="winrate-row">
-                    과거 승률 <b class="{wr_class}">{wr_txt}</b> (평균 수익률 {avg_txt}) {winrate_badge(n)}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("</div>", unsafe_allow_html=True)
+                """
+            card_html += "</div>"
+            render(card_html)
+        except Exception as e:
+            st.warning(f"종목 카드 하나를 표시하는 중 문제가 있어 건너뜁니다: {e}")
 
 st.divider()
 st.subheader("🏆 점수 랭킹 (전종목 100점 만점)")
@@ -268,44 +281,55 @@ st.caption(
 )
 
 if "_df_cache" in st.session_state and st.session_state["_df_cache"]:
-    weights, edges = sc.compute_factor_weights(st.session_state["_df_cache"])
+    try:
+        weights, edges = sc.compute_factor_weights(st.session_state["_df_cache"])
 
-    with st.expander("이번 스캔의 가중치는 이렇게 산출됐어요"):
-        w_df = pd.DataFrame([
-            {"항목": sc.FACTORS[k]["label"], "가중치(%)": weights[k],
-             "표본 종목 수": edges[k][1], "효과크기(참고용)": round(edges[k][0] * 100, 2)}
-            for k in sc.FACTORS
-        ]).sort_values("가중치(%)", ascending=False)
-        st.dataframe(w_df, use_container_width=True, hide_index=True)
-        st.caption(
-            "효과크기는 '항목 값 상위 30% 날들'과 '하위 30% 날들'의 평균 향후 10일 수익률 차이(%)입니다. "
-            "표본 종목 수가 적으면 이 가중치도 그만큼 불안정합니다."
-        )
+        with st.expander("이번 스캔의 가중치는 이렇게 산출됐어요"):
+            w_df = pd.DataFrame([
+                {"항목": sc.FACTORS[k]["label"], "가중치(%)": weights[k],
+                 "표본 종목 수": edges[k][1], "효과크기(참고용)": round(edges[k][0] * 100, 2)}
+                for k in sc.FACTORS
+            ]).sort_values("가중치(%)", ascending=False)
+            st.dataframe(w_df, use_container_width=True, hide_index=True)
+            st.caption(
+                "효과크기는 '항목 값 상위 30% 날들'과 '하위 30% 날들'의 평균 향후 10일 수익률 차이(%)입니다. "
+                "표본 종목 수가 적으면 이 가중치도 그만큼 불안정합니다."
+            )
 
-    scored = sc.score_universe(st.session_state["_df_cache"], weights, st.session_state.get("_name_cache", {}))
-    top_scored = scored[:20]
+        scored = sc.score_universe(st.session_state["_df_cache"], weights, st.session_state.get("_name_cache", {}))
+        top_scored = scored[:20]
 
-    for i, s in enumerate(top_scored, 1):
-        cur = "원" if s["market"] == "kr" else "$"
-        rank_color = "#4fbf8f" if s["score"] >= 70 else ("#e0a84f" if s["score"] >= 50 else "#8b8f98")
-        breakdown_html = "".join(
-            f'<div class="factor-row"><span>{b["label"]}</span>'
-            f'<span>{b["raw"]*100:.0f}점 × 가중치{b["weight"]:.0f}% = {b["contribution"]:.1f}</span></div>'
-            for b in s["breakdown"].values()
-        )
-        st.markdown(f"""
-        <div class="card">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <div class="card-title" style="margin-bottom:0;">
-                    <span style="color:{rank_color}; font-weight:700;">#{i}</span>
-                    &nbsp; {s['name']} <span style="color:#5c616b; font-weight:400;">({s['ticker']})</span>
+        if not top_scored:
+            st.info("점수를 계산할 데이터가 아직 없습니다. 스캔을 한 번 더 실행해보세요.")
+
+        for i, s in enumerate(top_scored, 1):
+            try:
+                cur = "원" if s["market"] == "kr" else "$"
+                rank_color = "#4fbf8f" if s["score"] >= 70 else ("#e0a84f" if s["score"] >= 50 else "#8b8f98")
+                breakdown_html = "".join(
+                    f'<div class="factor-row"><span>{b["label"]}</span>'
+                    f'<span>{b["raw"]*100:.0f}점 × 가중치{b["weight"]:.0f}% = {b["contribution"]:.1f}</span></div>'
+                    for b in s["breakdown"].values()
+                )
+                card_html = f"""
+                <div class="card">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div class="card-title" style="margin-bottom:0;">
+                            <span style="color:{rank_color}; font-weight:700;">#{i}</span>
+                            &nbsp; {s['name']} <span style="color:#5c616b; font-weight:400;">({s['ticker']})</span>
+                        </div>
+                        <div style="font-size:24px; font-weight:700; color:{rank_color};">{s['score']:.1f}점</div>
+                    </div>
+                    <div style="font-size:13px; color:#8b8f98; margin:6px 0 10px;">현재가 {s['close']:,.0f}{cur}</div>
+                    <div class="factor-breakdown">{breakdown_html}</div>
                 </div>
-                <div style="font-size:24px; font-weight:700; color:{rank_color};">{s['score']:.1f}점</div>
-            </div>
-            <div style="font-size:13px; color:#8b8f98; margin:6px 0 10px;">현재가 {s['close']:,.0f}{cur}</div>
-            <div class="factor-breakdown">{breakdown_html}</div>
-        </div>
-        """, unsafe_allow_html=True)
+                """
+                render(card_html)
+            except Exception as e:
+                st.warning(f"순위 #{i} 카드를 표시하는 중 문제가 있어 건너뜁니다: {e}")
+    except Exception as e:
+        st.error(f"점수 계산 중 문제가 발생했습니다: {e}")
+        st.caption("아래 버튼으로 스캔을 다시 실행해보시거나, 이 에러 메시지를 그대로 알려주세요.")
 else:
     st.info("스캔을 먼저 실행하면 점수 랭킹이 여기 표시됩니다.")
 
