@@ -49,6 +49,11 @@ h1, h2, h3 { color: #e7e5df; }
 .wr-high { color: #4fbf8f; }
 .wr-mid  { color: #e0a84f; }
 .wr-low  { color: #e0685f; }
+.factor-breakdown { border-top: 1px solid #21252d; padding-top: 8px; }
+.factor-row {
+    display: flex; justify-content: space-between; font-size: 12px;
+    color: #a8acb3; padding: 3px 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -85,7 +90,10 @@ market_map = {"전체": "all", "국내만": "kr", "해외(S&P100)만": "us"}
 def run_scan_with_progress(market_key, top_n, strat_keys):
     if "_df_cache" not in st.session_state:
         st.session_state["_df_cache"] = {}
+    if "_name_cache" not in st.session_state:
+        st.session_state["_name_cache"] = {}
     df_cache = st.session_state["_df_cache"]
+    name_cache = st.session_state["_name_cache"]
 
     progress_bar = st.progress(0, text="시작 중...")
     markets = [m for m in (["kr"] if market_key in ("kr", "all") else []) +
@@ -100,7 +108,7 @@ def run_scan_with_progress(market_key, top_n, strat_keys):
             frac = (mi + done / max(total, 1)) / total_markets
             progress_bar.progress(min(frac, 1.0), text=f"{label} 스캔 중... ({done}/{total})")
 
-        results += sc.scan_market(m, top_n, strat_keys, progress_callback=cb, df_cache=df_cache)
+        results += sc.scan_market(m, top_n, strat_keys, progress_callback=cb, df_cache=df_cache, name_cache=name_cache)
 
     progress_bar.progress(1.0, text="완료")
     progress_bar.empty()
@@ -250,6 +258,56 @@ else:
             """, unsafe_allow_html=True)
 
         st.markdown("</div>", unsafe_allow_html=True)
+
+st.divider()
+st.subheader("🏆 점수 랭킹 (전종목 100점 만점)")
+st.caption(
+    "전략 신호가 '있다/없다'로 안 걸려도, 모든 종목을 5개 항목 기준으로 채점해서 순위를 매깁니다. "
+    "가중치는 제 의견이 아니라 지금 스캔한 종목들의 실제 과거 데이터에서 "
+    "'이 항목 값이 높았던 날 vs 낮았던 날'의 향후 10일 수익률 차이를 역산해서 자동 산출한 값입니다."
+)
+
+if "_df_cache" in st.session_state and st.session_state["_df_cache"]:
+    weights, edges = sc.compute_factor_weights(st.session_state["_df_cache"])
+
+    with st.expander("이번 스캔의 가중치는 이렇게 산출됐어요"):
+        w_df = pd.DataFrame([
+            {"항목": sc.FACTORS[k]["label"], "가중치(%)": weights[k],
+             "표본 종목 수": edges[k][1], "효과크기(참고용)": round(edges[k][0] * 100, 2)}
+            for k in sc.FACTORS
+        ]).sort_values("가중치(%)", ascending=False)
+        st.dataframe(w_df, use_container_width=True, hide_index=True)
+        st.caption(
+            "효과크기는 '항목 값 상위 30% 날들'과 '하위 30% 날들'의 평균 향후 10일 수익률 차이(%)입니다. "
+            "표본 종목 수가 적으면 이 가중치도 그만큼 불안정합니다."
+        )
+
+    scored = sc.score_universe(st.session_state["_df_cache"], weights, st.session_state.get("_name_cache", {}))
+    top_scored = scored[:20]
+
+    for i, s in enumerate(top_scored, 1):
+        cur = "원" if s["market"] == "kr" else "$"
+        rank_color = "#4fbf8f" if s["score"] >= 70 else ("#e0a84f" if s["score"] >= 50 else "#8b8f98")
+        breakdown_html = "".join(
+            f'<div class="factor-row"><span>{b["label"]}</span>'
+            f'<span>{b["raw"]*100:.0f}점 × 가중치{b["weight"]:.0f}% = {b["contribution"]:.1f}</span></div>'
+            for b in s["breakdown"].values()
+        )
+        st.markdown(f"""
+        <div class="card">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div class="card-title" style="margin-bottom:0;">
+                    <span style="color:{rank_color}; font-weight:700;">#{i}</span>
+                    &nbsp; {s['name']} <span style="color:#5c616b; font-weight:400;">({s['ticker']})</span>
+                </div>
+                <div style="font-size:24px; font-weight:700; color:{rank_color};">{s['score']:.1f}점</div>
+            </div>
+            <div style="font-size:13px; color:#8b8f98; margin:6px 0 10px;">현재가 {s['close']:,.0f}{cur}</div>
+            <div class="factor-breakdown">{breakdown_html}</div>
+        </div>
+        """, unsafe_allow_html=True)
+else:
+    st.info("스캔을 먼저 실행하면 점수 랭킹이 여기 표시됩니다.")
 
 with st.expander("전체 결과 (신호 없는 것 포함)"):
     df = pd.DataFrame(results)
