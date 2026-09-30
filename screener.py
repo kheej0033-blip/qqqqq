@@ -168,6 +168,112 @@ STRATEGIES = {
 }
 
 
+# ---------- 점수제 (데이터 기반 가중치) ----------
+# 각 팩터는 0~1 사이 연속값. 가중치는 의견이 아니라, 실제 스캔한 유니버스에서
+# "이 팩터 값이 높았던 날 vs 낮았던 날"의 향후 수익률 차이(효과 크기)를 계산해서
+# 그 크기에 비례하게 자동 산출한다. 스캔할 때마다 그 시점 데이터로 재계산됨.
+
+FACTOR_FORWARD_DAYS = 10
+
+
+def _factor_mfi_oversold(df):
+    return ((50 - df["mfi"]) / 50).clip(0, 1)
+
+def _factor_supertrend(df):
+    return (df["st_trend"] == 1).astype(float)
+
+def _factor_volume(df):
+    return ((df["vol_ratio"] - 1) / 2).clip(0, 1)
+
+def _factor_trend_align(df):
+    above_long = (df["close"] > df["ma_long"]).astype(float)
+    above_short = (df["close"] > df["ma_short"]).astype(float)
+    return above_long * 0.5 + above_short * 0.5
+
+def _factor_near_high(df):
+    return (df["close"] / df["rolling_high"]).clip(0, 1)
+
+
+FACTORS = {
+    "mfi_oversold": {"label": "MFI 과매도", "fn": _factor_mfi_oversold},
+    "supertrend": {"label": "슈퍼트렌드 상승", "fn": _factor_supertrend},
+    "volume": {"label": "거래량 강도", "fn": _factor_volume},
+    "trend_align": {"label": "이동평균 정배열", "fn": _factor_trend_align},
+    "near_high": {"label": "신고가 근접도", "fn": _factor_near_high},
+}
+
+
+def compute_factor_weights(df_cache, forward_days=FACTOR_FORWARD_DAYS):
+    """
+    팩터별 가중치를 과거 데이터에서 역산.
+    반환: (weights dict 0~100 합=100, edges dict 원본 효과크기 — 참고용)
+    """
+    edges = {}
+    for fkey, finfo in FACTORS.items():
+        highs, lows, sample_n = [], [], 0
+        for (_market, _ticker), df in df_cache.items():
+            if df is None or len(df) < forward_days + 30:
+                continue
+            try:
+                fscore = finfo["fn"](df)
+            except Exception:
+                continue
+            fwd_ret = df["close"].shift(-forward_days) / df["close"] - 1
+            valid = fscore.notna() & fwd_ret.notna()
+            if valid.sum() < 30:
+                continue
+            fs, fr = fscore[valid], fwd_ret[valid]
+            hi_thr, lo_thr = fs.quantile(0.7), fs.quantile(0.3)
+            hi_mask, lo_mask = fs >= hi_thr, fs <= lo_thr
+            if hi_mask.sum() >= 10 and lo_mask.sum() >= 10:
+                highs.append(fr[hi_mask].mean())
+                lows.append(fr[lo_mask].mean())
+                sample_n += 1
+        edges[fkey] = (float(np.mean(highs) - np.mean(lows)) if highs and lows else 0.0, sample_n)
+
+    total = sum(abs(v[0]) for v in edges.values())
+    n_factors = len(FACTORS)
+    if total == 0:
+        weights = {k: round(100 / n_factors, 1) for k in FACTORS}
+    else:
+        weights = {k: round(abs(v[0]) / total * 100, 1) for k, v in edges.items()}
+    return weights, edges
+
+
+def score_ticker(df, weights):
+    breakdown = {}
+    total_score = 0.0
+    for fkey, finfo in FACTORS.items():
+        try:
+            fscore = finfo["fn"](df).iloc[-1]
+        except Exception:
+            fscore = 0.0
+        if pd.isna(fscore):
+            fscore = 0.0
+        w = weights.get(fkey, 0)
+        contrib = fscore * w
+        breakdown[fkey] = {"label": finfo["label"], "raw": float(fscore), "weight": w, "contribution": contrib}
+        total_score += contrib
+    return round(total_score, 1), breakdown
+
+
+def score_universe(df_cache, weights, names=None):
+    names = names or {}
+    results = []
+    for (market, ticker), df in df_cache.items():
+        if df is None or len(df) < 30:
+            continue
+        score, breakdown = score_ticker(df, weights)
+        results.append({
+            "market": market, "ticker": ticker,
+            "name": names.get((market, ticker), ticker),
+            "score": score, "breakdown": breakdown,
+            "close": float(df["close"].iloc[-1]),
+        })
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results
+
+
 # ---------- 백테스트 (공통 엔진) ----------
 
 def backtest_strategy(df, strat):
@@ -380,13 +486,15 @@ def _fetch_and_build(ticker, fetch):
     return build_indicators(df)
 
 
-def scan_market(market, top_n, strategy_keys=None, progress_callback=None, max_workers=8, df_cache=None):
+def scan_market(market, top_n, strategy_keys=None, progress_callback=None, max_workers=8, df_cache=None, name_cache=None):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     if strategy_keys is None:
         strategy_keys = list(STRATEGIES.keys())
     if df_cache is None:
         df_cache = {}
+    if name_cache is None:
+        name_cache = {}
 
     if market == "kr":
         tickers, names = get_kr_universe(top_n)
@@ -397,6 +505,9 @@ def scan_market(market, top_n, strategy_keys=None, progress_callback=None, max_w
         tickers = tickers[:top_n]
         fetch = get_us_ohlcv
         currency = "$"
+
+    for t in tickers:
+        name_cache[(market, t)] = names.get(t, t)
 
     results = []
     fetch_fail = 0
